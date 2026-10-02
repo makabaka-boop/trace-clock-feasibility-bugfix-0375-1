@@ -78,7 +78,7 @@ func TestSolveInfeasibleHasNoTimelineData(t *testing.T) {
 	if raw["status"] != "infeasible" {
 		t.Fatalf("期望 infeasible: %s", rec.Body)
 	}
-	for _, k := range []string{"offsets", "spans", "constraints", "order"} {
+	for _, k := range []string{"offsets", "spans", "constraints", "order", "observations"} {
 		if _, present := raw[k]; present {
 			t.Fatalf("无解响应不得包含字段 %q: %s", k, rec.Body)
 		}
@@ -93,6 +93,90 @@ func TestSolveInfeasibleHasNoTimelineData(t *testing.T) {
 	}
 	if w, _ := cyc["totalWeight"].(float64); w >= 0 {
 		t.Fatalf("矛盾环总权重应为负: %v", w)
+	}
+}
+
+// 两种形态的观测一起求解：响应须携带逐条观测余量，且与偏移自洽。
+func TestSolveWithObservations(t *testing.T) {
+	rec := postSolve(t, `{
+		"services": [{"id":"a","lo":0,"hi":0},{"id":"b","lo":-10,"hi":10}],
+		"spans": [
+			{"id":"s1","service":"a","parent":"","start":0,"end":100},
+			{"id":"s2","service":"b","parent":"","start":10,"end":20}
+		],
+		"observations": [
+			{"id":"o1","earlierSpan":"s1","laterSpan":"s2","earlierPoint":"start","laterPoint":"end","min":5,"max":15},
+			{"id":"o2","earlier":"a","later":"b","min":-10,"max":-5}
+		]
+	}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 %d: %s", rec.Code, rec.Body)
+	}
+	var res solver.Result
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != "ok" {
+		t.Fatalf("期望 ok: %s", rec.Body)
+	}
+	// o1 要求 x_b ∈ [-15,-5]，o2 要求 x_b ∈ [-10,-5]，字典序最小取 -10。
+	if res.Offsets["b"] != -10 {
+		t.Fatalf("偏移错误: %+v", res.Offsets)
+	}
+	if len(res.Observations) != 2 {
+		t.Fatalf("缺少观测余量: %s", rec.Body)
+	}
+	wantDiff := map[string]int{"o1": 10, "o2": -10}
+	for _, o := range res.Observations {
+		if o.Difference != wantDiff[o.ID] {
+			t.Fatalf("观测 %s 差值错误: %+v", o.ID, o)
+		}
+		if o.MinSlack < 0 || o.MaxSlack < 0 {
+			t.Fatalf("观测 %s 余量为负: %+v", o.ID, o)
+		}
+	}
+}
+
+// 观测与偏移界冲突时判无解，证据须含观测约束边且不携带时间线字段。
+func TestSolveObservationConflict(t *testing.T) {
+	rec := postSolve(t, `{
+		"services": [{"id":"a","lo":0,"hi":0},{"id":"b","lo":0,"hi":2}],
+		"spans": [],
+		"observations": [{"id":"o1","earlier":"a","later":"b","min":5,"max":9}]
+	}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 %d: %s", rec.Code, rec.Body)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw["status"] != "infeasible" {
+		t.Fatalf("期望 infeasible: %s", rec.Body)
+	}
+	for _, k := range []string{"offsets", "spans", "constraints", "order", "observations"} {
+		if _, present := raw[k]; present {
+			t.Fatalf("无解响应不得包含字段 %q: %s", k, rec.Body)
+		}
+	}
+	cyc, ok := raw["cycle"].(map[string]any)
+	if !ok {
+		t.Fatalf("缺少矛盾环: %s", rec.Body)
+	}
+	edges, ok := cyc["edges"].([]any)
+	if !ok || len(edges) == 0 {
+		t.Fatalf("矛盾环为空: %s", rec.Body)
+	}
+	hasObsEdge := false
+	for _, e := range edges {
+		edge, _ := e.(map[string]any)
+		ref, _ := edge["ref"].(map[string]any)
+		if k, _ := ref["kind"].(string); k == "observation_min" || k == "observation_max" {
+			hasObsEdge = true
+		}
+	}
+	if !hasObsEdge {
+		t.Fatalf("矛盾环应包含观测约束边: %s", rec.Body)
 	}
 }
 

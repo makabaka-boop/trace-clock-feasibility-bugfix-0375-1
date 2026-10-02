@@ -56,6 +56,13 @@ func feasibleVec(in Input, order []string, vec []int) bool {
 			return false
 		}
 	}
+	for _, obs := range in.Observations {
+		earlierSvc, laterSvc, delta := observationEndpoints(obs, spans)
+		diff := off[laterSvc] - off[earlierSvc] + delta
+		if diff < obs.Min || diff > obs.Max {
+			return false
+		}
+	}
 	return true
 }
 
@@ -99,6 +106,28 @@ func randInput(r *rand.Rand) Input {
 			sp.Parent = in.Spans[r.Intn(i)].ID
 		}
 		in.Spans = append(in.Spans, sp)
+	}
+	// 随机附加 0~3 条观测：服务间或 span 起止端点（时刻可为负、两端可
+	// 落在同一服务，且观测之间/观测与调用链可能真正冲突——可行性结论
+	// 与字典序最小解都由穷举对拍保证）。
+	for i := 0; i < r.Intn(4); i++ {
+		obs := OffsetObservation{ID: "o" + string(rune('0'+i))}
+		obs.Min = -6 + r.Intn(13)
+		obs.Max = obs.Min + r.Intn(13)
+		if r.Intn(2) == 0 {
+			obs.EarlierSpan = in.Spans[r.Intn(len(in.Spans))].ID
+			obs.LaterSpan = in.Spans[r.Intn(len(in.Spans))].ID
+			obs.EarlierPoint = []string{"start", "end"}[r.Intn(2)]
+			obs.LaterPoint = []string{"start", "end"}[r.Intn(2)]
+		} else {
+			a, b := r.Intn(nSvc), r.Intn(nSvc-1)
+			if b >= a {
+				b++
+			}
+			obs.Earlier = in.Services[a].ID
+			obs.Later = in.Services[b].ID
+		}
+		in.Observations = append(in.Observations, obs)
 	}
 	return in
 }
@@ -165,6 +194,35 @@ func checkSlacks(t *testing.T, in Input, res Result) {
 			t.Fatalf("缺少 span %s 的余量条目", sp.ID)
 		}
 	}
+	obsByID := map[string]OffsetObservation{}
+	for _, obs := range in.Observations {
+		obsByID[obs.ID] = obs
+	}
+	seenObs := map[string]bool{}
+	for _, o := range res.Observations {
+		obs, ok := obsByID[o.ID]
+		if !ok {
+			t.Fatalf("观测余量引用了不存在的观测: %+v", o)
+		}
+		seenObs[o.ID] = true
+		earlierSvc, laterSvc, delta := observationEndpoints(obs, spans)
+		wantDiff := res.Offsets[laterSvc] - res.Offsets[earlierSvc] + delta
+		if o.Difference != wantDiff {
+			t.Fatalf("观测 %s 差值错误: got %d want %d", o.ID, o.Difference, wantDiff)
+		}
+		if o.MinSlack != wantDiff-obs.Min || o.MaxSlack != obs.Max-wantDiff {
+			t.Fatalf("观测 %s 余量错误: got (%d,%d) want (%d,%d)",
+				o.ID, o.MinSlack, o.MaxSlack, wantDiff-obs.Min, obs.Max-wantDiff)
+		}
+		if o.MinSlack < 0 || o.MaxSlack < 0 {
+			t.Fatalf("观测 %s 余量为负: %+v", o.ID, o)
+		}
+	}
+	for _, obs := range in.Observations {
+		if !seenObs[obs.ID] {
+			t.Fatalf("缺少观测 %s 的余量条目", obs.ID)
+		}
+	}
 }
 
 // ---------- 矛盾环逐边核验 ----------
@@ -187,6 +245,10 @@ func checkCycleEvidence(t *testing.T, in Input, cyc *Cycle) {
 	for _, sp := range in.Spans {
 		spans[sp.ID] = sp
 	}
+	obsByID := map[string]OffsetObservation{}
+	for _, obs := range in.Observations {
+		obsByID[obs.ID] = obs
+	}
 	sum := 0
 	for i, ce := range cyc.Edges {
 		next := cyc.Edges[(i+1)%len(cyc.Edges)]
@@ -194,7 +256,7 @@ func checkCycleEvidence(t *testing.T, in Input, cyc *Cycle) {
 			t.Fatalf("第 %d 条边 %s->%s 与下一条 %s->%s 不相接", i, ce.From, ce.To, next.From, next.To)
 		}
 		sum += ce.Weight
-		checkEdgeAgainstInput(t, i, ce, svc, spans)
+		checkEdgeAgainstInput(t, i, ce, svc, spans, obsByID)
 	}
 	if sum != cyc.TotalWeight {
 		t.Fatalf("环总权重不一致: 边求和=%d 报告=%d", sum, cyc.TotalWeight)
@@ -205,7 +267,7 @@ func checkCycleEvidence(t *testing.T, in Input, cyc *Cycle) {
 }
 
 // checkEdgeAgainstInput 按边声明的来源，从原始输入独立重算权重与端点。
-func checkEdgeAgainstInput(t *testing.T, i int, ce CycleEdge, svc map[string]Service, spans map[string]Span) {
+func checkEdgeAgainstInput(t *testing.T, i int, ce CycleEdge, svc map[string]Service, spans map[string]Span, obsByID map[string]OffsetObservation) {
 	t.Helper()
 	var wantFrom, wantTo string
 	var wantW int
@@ -234,6 +296,17 @@ func checkEdgeAgainstInput(t *testing.T, i int, ce CycleEdge, svc map[string]Ser
 			t.Fatalf("第 %d 条边引用了不存在的父子关系 %+v", i, ce.Ref)
 		}
 		wantFrom, wantTo, wantW = p.Service, sp.Service, p.End-sp.End
+	case KindObservationMax, KindObservationMin:
+		obs, ok := obsByID[ce.Ref.Observation]
+		if !ok {
+			t.Fatalf("第 %d 条边引用未知观测 %q", i, ce.Ref.Observation)
+		}
+		earlierSvc, laterSvc, delta := observationEndpoints(obs, spans)
+		if ce.Ref.Kind == KindObservationMax {
+			wantFrom, wantTo, wantW = earlierSvc, laterSvc, obs.Max-delta
+		} else {
+			wantFrom, wantTo, wantW = laterSvc, earlierSvc, delta-obs.Min
+		}
 	default:
 		t.Fatalf("第 %d 条边来源类型未知: %q", i, ce.Ref.Kind)
 	}
@@ -360,6 +433,230 @@ func TestNoSpans(t *testing.T) {
 	}
 }
 
+// ---------- 观测 ----------
+
+// 回归：span 端点观测曾被整体忽略（边退化为零点自环），可行输入被判
+// 无解且证据只含基准点。
+func TestSpanPointObservationFeasible(t *testing.T) {
+	in := Input{
+		Services: []Service{{ID: "a", Lo: 0, Hi: 0}, {ID: "b", Lo: -10, Hi: 10}},
+		Spans: []Span{
+			{ID: "s1", Service: "a", Start: 0, End: 100},
+			{ID: "s2", Service: "b", Start: 10, End: 20},
+		},
+		Observations: []OffsetObservation{
+			// s1.start → s2.end 的校正耗时应落在 [5,15]：
+			// delta = 20-0 = 20，故 x_b ∈ [-15,-5]。
+			{ID: "o1", EarlierSpan: "s1", LaterSpan: "s2",
+				EarlierPoint: "start", LaterPoint: "end", Min: 5, Max: 15},
+		},
+	}
+	res, err := Solve(in)
+	if err != nil || res.Status != "ok" {
+		t.Fatalf("期望可行: %+v err=%v", res, err)
+	}
+	if res.Offsets["b"] != -10 {
+		t.Fatalf("字典序最小应在可行域 [-10,-5] 取 -10，实际 %d", res.Offsets["b"])
+	}
+	if len(res.Observations) != 1 {
+		t.Fatalf("缺少观测余量: %+v", res)
+	}
+	if o := res.Observations[0]; o.Difference != 10 || o.MinSlack != 5 || o.MaxSlack != 5 {
+		t.Fatalf("观测余量错误: %+v", o)
+	}
+}
+
+// 回归：服务间观测的下界边方向曾经写反，解违反观测下界、余量为负。
+func TestServiceObservationRespectsMin(t *testing.T) {
+	in := Input{
+		Services: []Service{{ID: "a", Lo: 0, Hi: 0}, {ID: "b", Lo: -10, Hi: 10}},
+		Observations: []OffsetObservation{
+			{ID: "o1", Earlier: "a", Later: "b", Min: 3, Max: 8},
+		},
+	}
+	res, err := Solve(in)
+	if err != nil || res.Status != "ok" {
+		t.Fatalf("期望可行: %+v err=%v", res, err)
+	}
+	if res.Offsets["b"] != 3 {
+		t.Fatalf("x_b 应取观测下界 3，实际 %d", res.Offsets["b"])
+	}
+	if o := res.Observations[0]; o.Difference != 3 || o.MinSlack != 0 || o.MaxSlack != 5 {
+		t.Fatalf("观测余量错误: %+v", o)
+	}
+}
+
+// 负时间戳 + 混用起止端点：端点本地时刻为负时 delta 同样为负。
+func TestSpanObservationNegativeTimestamps(t *testing.T) {
+	in := Input{
+		Services: []Service{{ID: "a", Lo: 0, Hi: 0}, {ID: "b", Lo: 0, Hi: 50}},
+		Spans: []Span{
+			{ID: "s1", Service: "a", Start: -50, End: -10},
+			{ID: "s2", Service: "b", Start: -40, End: -5},
+		},
+		Observations: []OffsetObservation{
+			// s1.end → s2.start：delta = -40-(-10) = -30，
+			// 校正差值 ∈ [0,100] => x_b ∈ [30,130]。
+			{ID: "o1", EarlierSpan: "s1", LaterSpan: "s2",
+				EarlierPoint: "end", LaterPoint: "start", Min: 0, Max: 100},
+		},
+	}
+	res, err := Solve(in)
+	if err != nil || res.Status != "ok" {
+		t.Fatalf("期望可行: %+v err=%v", res, err)
+	}
+	if res.Offsets["b"] != 30 {
+		t.Fatalf("x_b 应在可行域 [30,50] 取 30，实际 %d", res.Offsets["b"])
+	}
+	if o := res.Observations[0]; o.Difference != 0 || o.MinSlack != 0 || o.MaxSlack != 100 {
+		t.Fatalf("观测余量错误: %+v", o)
+	}
+}
+
+// 多条观测串联时的字典序最小解与逐条余量。
+func TestMultipleObservationsLexMin(t *testing.T) {
+	in := Input{
+		Services: []Service{
+			{ID: "a", Lo: 0, Hi: 0},
+			{ID: "b", Lo: -10, Hi: 10},
+			{ID: "c", Lo: -10, Hi: 10},
+		},
+		Observations: []OffsetObservation{
+			{ID: "o1", Earlier: "a", Later: "b", Min: 2, Max: 5},
+			{ID: "o2", Earlier: "b", Later: "c", Min: 1, Max: 4},
+		},
+	}
+	res, err := Solve(in)
+	if err != nil || res.Status != "ok" {
+		t.Fatalf("期望可行: %+v err=%v", res, err)
+	}
+	want := map[string]int{"a": 0, "b": 2, "c": 3}
+	for id, v := range want {
+		if res.Offsets[id] != v {
+			t.Fatalf("字典序最小解应为 %+v，实际 %+v", want, res.Offsets)
+		}
+	}
+	if o := res.Observations[0]; o.Difference != 2 || o.MinSlack != 0 || o.MaxSlack != 3 {
+		t.Fatalf("观测 o1 余量错误: %+v", o)
+	}
+	if o := res.Observations[1]; o.Difference != 1 || o.MinSlack != 0 || o.MaxSlack != 3 {
+		t.Fatalf("观测 o2 余量错误: %+v", o)
+	}
+}
+
+// 观测与父子约束、偏移界共同决定可行域。
+func TestObservationCombinedWithSpans(t *testing.T) {
+	in := Input{
+		Services: []Service{{ID: "a", Lo: 0, Hi: 0}, {ID: "b", Lo: -10, Hi: 10}},
+		Spans: []Span{
+			{ID: "s1", Service: "a", Start: 0, End: 100},
+			{ID: "s2", Service: "b", Parent: "s1", Start: 10, End: 20},
+		},
+		Observations: []OffsetObservation{
+			// 父子包含要求 x_b ∈ [-10,80]；观测再要求 x_b ∈ [4,6]。
+			{ID: "o1", Earlier: "a", Later: "b", Min: 4, Max: 6},
+			// s2.start → s1.end：差值 = (100+x_a)-(10+x_b) = 90-x_b，
+			// 落在 [75,85] => x_b ∈ [5,15]，与上一条交集为 x_b ∈ [5,6]。
+			{ID: "o2", EarlierSpan: "s2", LaterSpan: "s1",
+				EarlierPoint: "start", LaterPoint: "end", Min: 75, Max: 85},
+		},
+	}
+	res, err := Solve(in)
+	if err != nil || res.Status != "ok" {
+		t.Fatalf("期望可行: %+v err=%v", res, err)
+	}
+	if res.Offsets["b"] != 5 {
+		t.Fatalf("x_b 应在可行域 [5,6] 取 5，实际 %d", res.Offsets["b"])
+	}
+	if o := res.Observations[0]; o.Difference != 5 || o.MinSlack != 1 || o.MaxSlack != 1 {
+		t.Fatalf("观测 o1 余量错误: %+v", o)
+	}
+	if o := res.Observations[1]; o.Difference != 85 || o.MinSlack != 10 || o.MaxSlack != 0 {
+		t.Fatalf("观测 o2 余量错误: %+v", o)
+	}
+}
+
+// 真正冲突：观测要求 x_b >= 5，b 的上界却是 2。证据须逐边核验，
+// 且环中必须包含观测约束边。
+func TestObservationConflictInfeasible(t *testing.T) {
+	in := Input{
+		Services: []Service{{ID: "a", Lo: 0, Hi: 0}, {ID: "b", Lo: 0, Hi: 2}},
+		Observations: []OffsetObservation{
+			{ID: "o1", Earlier: "a", Later: "b", Min: 5, Max: 9},
+		},
+	}
+	res, err := Solve(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != "infeasible" {
+		t.Fatalf("期望无解: %+v", res)
+	}
+	checkCycleEvidence(t, in, res.Cycle)
+	hasObsEdge := false
+	for _, e := range res.Cycle.Edges {
+		if e.Ref.Kind == KindObservationMin || e.Ref.Kind == KindObservationMax {
+			hasObsEdge = true
+		}
+	}
+	if !hasObsEdge {
+		t.Fatalf("矛盾环应包含观测约束边: %+v", res.Cycle)
+	}
+}
+
+// 两条观测互相矛盾（区间无交集），同样须给出含观测边的矛盾环。
+func TestObservationsMutuallyInfeasible(t *testing.T) {
+	in := Input{
+		Services: []Service{{ID: "a", Lo: 0, Hi: 0}, {ID: "b", Lo: -10, Hi: 10}},
+		Observations: []OffsetObservation{
+			{ID: "o1", Earlier: "a", Later: "b", Min: 5, Max: 8},
+			{ID: "o2", Earlier: "a", Later: "b", Min: -4, Max: 2},
+		},
+	}
+	res, err := Solve(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != "infeasible" {
+		t.Fatalf("期望无解: %+v", res)
+	}
+	checkCycleEvidence(t, in, res.Cycle)
+}
+
+// 同服务两个 span 端点间的耗时观测：约束不含未知量，直接由本地时刻
+// 决定可行与否。
+func TestSpanObservationSameService(t *testing.T) {
+	in := Input{
+		Services: []Service{{ID: "a", Lo: 0, Hi: 0}, {ID: "b", Lo: -5, Hi: 5}},
+		Spans: []Span{
+			{ID: "s1", Service: "b", Start: 10, End: 20},
+			{ID: "s2", Service: "b", Start: 30, End: 40},
+		},
+		Observations: []OffsetObservation{
+			// s1.end → s2.start 的本地差恒为 10，与 [5,15] 相容。
+			{ID: "o1", EarlierSpan: "s1", LaterSpan: "s2",
+				EarlierPoint: "end", LaterPoint: "start", Min: 5, Max: 15},
+		},
+	}
+	res, err := Solve(in)
+	if err != nil || res.Status != "ok" {
+		t.Fatalf("期望可行: %+v err=%v", res, err)
+	}
+	if o := res.Observations[0]; o.Difference != 10 || o.MinSlack != 5 || o.MaxSlack != 5 {
+		t.Fatalf("观测余量错误: %+v", o)
+	}
+	// 把区间改成 [11,15] 后与恒定的本地差 10 矛盾。
+	in.Observations[0].Min = 11
+	res, err = Solve(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != "infeasible" {
+		t.Fatalf("期望无解: %+v", res)
+	}
+	checkCycleEvidence(t, in, res.Cycle)
+}
+
 // ---------- 校验 ----------
 
 func TestValidate(t *testing.T) {
@@ -403,6 +700,37 @@ func TestValidate(t *testing.T) {
 			in.Spans[1].Parent = "s1"
 		}},
 		{"量级超限", func(in *Input) { in.Spans[0].End = maxAbs + 1 }},
+		{"观测区间颠倒", func(in *Input) {
+			in.Observations = []OffsetObservation{{ID: "o1", Earlier: "a", Later: "b", Min: 6, Max: 5}}
+		}},
+		{"观测服务对相同", func(in *Input) {
+			in.Observations = []OffsetObservation{{ID: "o1", Earlier: "a", Later: "a", Min: 0, Max: 1}}
+		}},
+		{"观测引用未知服务", func(in *Input) {
+			in.Observations = []OffsetObservation{{ID: "o1", Earlier: "a", Later: "zz", Min: 0, Max: 1}}
+		}},
+		{"观测ID重复", func(in *Input) {
+			in.Observations = []OffsetObservation{
+				{ID: "o1", Earlier: "a", Later: "b", Min: 0, Max: 1},
+				{ID: "o1", Earlier: "a", Later: "b", Min: 0, Max: 1},
+			}
+		}},
+		{"观测span不存在", func(in *Input) {
+			in.Observations = []OffsetObservation{{ID: "o1", EarlierSpan: "ghost", LaterSpan: "s1",
+				EarlierPoint: "start", LaterPoint: "end", Min: 0, Max: 1}}
+		}},
+		{"观测只给了一个span", func(in *Input) {
+			in.Observations = []OffsetObservation{{ID: "o1", EarlierSpan: "s1",
+				EarlierPoint: "start", LaterPoint: "end", Min: 0, Max: 1}}
+		}},
+		{"观测端点无效", func(in *Input) {
+			in.Observations = []OffsetObservation{{ID: "o1", EarlierSpan: "s1", LaterSpan: "s2",
+				EarlierPoint: "middle", LaterPoint: "end", Min: 0, Max: 1}}
+		}},
+		{"观测服务与span不符", func(in *Input) {
+			in.Observations = []OffsetObservation{{ID: "o1", Earlier: "b", EarlierSpan: "s1", LaterSpan: "s2",
+				EarlierPoint: "start", LaterPoint: "end", Min: 0, Max: 1}}
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -414,6 +742,27 @@ func TestValidate(t *testing.T) {
 				t.Fatalf("应检出非法输入")
 			}
 		})
+	}
+}
+
+// 两种形态的合法观测（含服务字段与 span 服务一致的冗余填写）都应通过校验。
+func TestValidateObservationsOK(t *testing.T) {
+	in := Input{
+		Services: []Service{{ID: "a", Lo: 0, Hi: 0}, {ID: "b", Lo: -1, Hi: 1}},
+		Spans: []Span{
+			{ID: "s1", Service: "a", Start: 0, End: 10},
+			{ID: "s2", Service: "b", Parent: "s1", Start: 1, End: 2},
+		},
+		Observations: []OffsetObservation{
+			{ID: "o1", Earlier: "a", Later: "b", Min: -1, Max: 1},
+			{ID: "o2", EarlierSpan: "s1", LaterSpan: "s2",
+				EarlierPoint: "start", LaterPoint: "end", Min: 0, Max: 10},
+			{ID: "o3", Earlier: "a", Later: "b", EarlierSpan: "s1", LaterSpan: "s2",
+				EarlierPoint: "end", LaterPoint: "start", Min: -10, Max: 0},
+		},
+	}
+	if errs := Validate(in); len(errs) != 0 {
+		t.Fatalf("合法观测被误判: %v", errs)
 	}
 }
 

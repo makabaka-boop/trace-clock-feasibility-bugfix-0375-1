@@ -52,7 +52,7 @@ func handleExample(w http.ResponseWriter, r *http.Request) {
 }
 
 // feasibleExample 是一条四服务的调用链，各服务本地时钟有偏差，
-// 偏移界足够宽，存在可行校正。
+// 偏移界足够宽，存在可行校正；附带一条服务间偏移观测。
 func feasibleExample() solver.Input {
 	return solver.Input{
 		Services: []solver.Service{
@@ -67,6 +67,9 @@ func feasibleExample() solver.Input {
 			{ID: "s3", Service: "orders", Parent: "s1", Start: 400, End: 850},
 			{ID: "s4", Service: "pay", Parent: "s3", Start: 500, End: 700},
 			{ID: "s5", Service: "auth", Parent: "s1", Start: 320, End: 380},
+		},
+		Observations: []solver.OffsetObservation{
+			{ID: "o1", Earlier: "auth", Later: "orders", Min: -50, Max: 50},
 		},
 	}
 }

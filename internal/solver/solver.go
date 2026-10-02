@@ -44,8 +44,12 @@ type Input struct {
 	Observations []OffsetObservation `json:"observations,omitempty"`
 }
 
-// OffsetObservation is an independently measured bound on the difference
-// between two service clocks after correction.
+// OffsetObservation 是对校正后时间线上“较晚端 - 较早端”差值的独立
+// 测量，要求落在 [Min, Max]。端点有两种形式（互斥）：
+//   - 服务间观测：填写 Earlier/Later 服务，差值为 x[Later]-x[Earlier]；
+//   - span 端点观测：填写 EarlierSpan/EarlierPoint 与 LaterSpan/LaterPoint，
+//     端点为对应 span 的起点或终点，差值为校正后的端点时刻之差，此时
+//     Earlier/Later 可留空（取 span 所在服务），若填写则必须一致。
 type OffsetObservation struct {
 	ID           string `json:"id"`
 	Earlier      string `json:"earlier"`
@@ -62,12 +66,12 @@ type OffsetObservation struct {
 type EdgeKind string
 
 const (
-	KindBoundUpper     EdgeKind = "bound_upper" // x_i <= hi
-	KindBoundLower     EdgeKind = "bound_lower" // x_i >= lo
-	KindChildStart     EdgeKind = "child_start" // 子调用起点不早于父调用起点
-	KindChildEnd       EdgeKind = "child_end"   // 子调用终点不晚于父调用终点
-	KindObservationMin EdgeKind = "observation_min"
-	KindObservationMax EdgeKind = "observation_max"
+	KindBoundUpper     EdgeKind = "bound_upper"     // x_i <= hi
+	KindBoundLower     EdgeKind = "bound_lower"     // x_i >= lo
+	KindChildStart     EdgeKind = "child_start"     // 子调用起点不早于父调用起点
+	KindChildEnd       EdgeKind = "child_end"       // 子调用终点不晚于父调用终点
+	KindObservationMin EdgeKind = "observation_min" // 观测差值不低于下界
+	KindObservationMax EdgeKind = "observation_max" // 观测差值不高于上界
 )
 
 // EdgeRef 记录一条约束边对应的原始输入，用于把矛盾环还原成证据。
@@ -169,15 +173,25 @@ func Validate(in Input) []string {
 		}
 		seenObservation[obs.ID] = true
 		if obs.EarlierSpan != "" || obs.LaterSpan != "" {
-			if _, ok := byID[obs.EarlierSpan]; !ok {
+			es, okE := byID[obs.EarlierSpan]
+			ls, okL := byID[obs.LaterSpan]
+			if !okE {
 				add("观测 %s 引用了未知的起始 span", obs.ID)
 			}
-			if _, ok := byID[obs.LaterSpan]; !ok {
+			if !okL {
 				add("观测 %s 引用了未知的结束 span", obs.ID)
 			}
 			if (obs.EarlierPoint != "start" && obs.EarlierPoint != "end") ||
 				(obs.LaterPoint != "start" && obs.LaterPoint != "end") {
 				add("观测 %s 的 span 端点无效", obs.ID)
+			}
+			// 服务字段可留空（取 span 所在服务），若填写则必须一致，
+			// 否则同一条观测出现两种解释。
+			if okE && obs.Earlier != "" && obs.Earlier != es.Service {
+				add("观测 %s 的较早服务 %q 与 span %s 所在服务 %q 不一致", obs.ID, obs.Earlier, obs.EarlierSpan, es.Service)
+			}
+			if okL && obs.Later != "" && obs.Later != ls.Service {
+				add("观测 %s 的较晚服务 %q 与 span %s 所在服务 %q 不一致", obs.ID, obs.Later, obs.LaterSpan, ls.Service)
 			}
 		} else if !seenSvc[obs.Earlier] || !seenSvc[obs.Later] || obs.Earlier == obs.Later {
 			add("观测 %s 引用了无效的服务对", obs.ID)
@@ -238,11 +252,37 @@ type Result struct {
 	Observations []ObservationSlack `json:"observations,omitempty"`
 }
 
+// ObservationSlack 是一条观测在校正后的满足情况：Difference 为校正后
+// 较晚端与较早端的时刻差，MinSlack/MaxSlack 为到观测区间的余量（>=0）。
 type ObservationSlack struct {
 	ID         string `json:"id"`
 	Difference int    `json:"difference"`
 	MinSlack   int    `json:"minSlack"`
 	MaxSlack   int    `json:"maxSlack"`
+}
+
+// pointOf 返回 span 指定端点（"start"/"end"）的本地时刻。
+func pointOf(sp Span, point string) int {
+	if point == "end" {
+		return sp.End
+	}
+	return sp.Start
+}
+
+// observationEndpoints 把观测解析成两个服务端点与本地时刻差 delta，使
+//
+//	校正后较晚端时刻 - 校正后较早端时刻 = x[laterSvc] - x[earlierSvc] + delta
+//
+// 观测即要求该值落在 [Min, Max]。服务间观测 delta 为 0；span 端点观测
+// 的 delta 为两端点本地时刻之差，端点服务取 span 所在服务。
+func observationEndpoints(obs OffsetObservation, spans map[string]Span) (earlierSvc, laterSvc string, delta int) {
+	earlierSvc, laterSvc = obs.Earlier, obs.Later
+	if obs.EarlierSpan != "" || obs.LaterSpan != "" {
+		es, ls := spans[obs.EarlierSpan], spans[obs.LaterSpan]
+		earlierSvc, laterSvc = es.Service, ls.Service
+		delta = pointOf(ls, obs.LaterPoint) - pointOf(es, obs.EarlierPoint)
+	}
+	return earlierSvc, laterSvc, delta
 }
 
 // buildGraph 把输入化为差分约束图。
@@ -252,6 +292,8 @@ type ObservationSlack struct {
 //   - 子调用完整落在父调用内：
 //     c.start+x[cs] >= p.start+x[ps]  <=>  x[ps]-x[cs] <= c.start-p.start
 //     c.end  +x[cs] <= p.end  +x[ps]  <=>  x[cs]-x[ps] <= p.end-c.end
+//   - 观测 Min <= x[sl]-x[se]+delta <= Max 化为
+//     se->sl (权 Max-delta) 与 sl->se (权 delta-Min)。
 func buildGraph(in Input) (n int, idx map[string]int, order []string, edges []edge) {
 	order = make([]string, 0, len(in.Services))
 	svc := make(map[string]Service, len(in.Services))
@@ -289,10 +331,13 @@ func buildGraph(in Input) (n int, idx map[string]int, order []string, edges []ed
 		)
 	}
 	for _, obs := range in.Observations {
-		earlier, later := idx[obs.Earlier], idx[obs.Later]
+		earlierSvc, laterSvc, delta := observationEndpoints(obs, spans)
+		se, sl := idx[earlierSvc], idx[laterSvc]
 		edges = append(edges,
-			edge{from: earlier, to: later, w: obs.Max, ref: EdgeRef{Kind: KindObservationMax, Observation: obs.ID}},
-			edge{from: earlier, to: later, w: -obs.Min, ref: EdgeRef{Kind: KindObservationMin, Observation: obs.ID}},
+			// 差值 <= Max  <=>  x[sl]-x[se] <= Max-delta
+			edge{from: se, to: sl, w: obs.Max - delta, ref: EdgeRef{Kind: KindObservationMax, Observation: obs.ID}},
+			// 差值 >= Min  <=>  x[se]-x[sl] <= delta-Min
+			edge{from: sl, to: se, w: delta - obs.Min, ref: EdgeRef{Kind: KindObservationMin, Observation: obs.ID}},
 		)
 	}
 	return n, idx, order, edges
@@ -461,7 +506,8 @@ func Solve(in Input) (Result, error) {
 		})
 	}
 	for _, obs := range in.Observations {
-		difference := res.Offsets[obs.Later] - res.Offsets[obs.Earlier]
+		earlierSvc, laterSvc, delta := observationEndpoints(obs, spans)
+		difference := res.Offsets[laterSvc] - res.Offsets[earlierSvc] + delta
 		res.Observations = append(res.Observations, ObservationSlack{
 			ID: obs.ID, Difference: difference,
 			MinSlack: difference - obs.Min, MaxSlack: obs.Max - difference,

@@ -62,6 +62,16 @@ describe('结果失效', () => {
     expect(isStale(snap, services, edited)).toBe(true);
   });
 
+  it('编辑观测后旧结果立即失效', () => {
+    const observations = [{ id: 'o1', earlier: 'a', later: 'b', min: 0, max: 5 }];
+    const snap = markSolved(services, spans, observations);
+    expect(isStale(snap, services, spans, observations)).toBe(false);
+    const edited = [{ ...observations[0], max: 6 }];
+    expect(isStale(snap, services, spans, edited)).toBe(true);
+    expect(isStale(snap, services, spans, [])).toBe(true);
+    expect(canDrawTimeline(okResult, true)).toBe(false);
+  });
+
   it('重新求解后结果恢复可见', () => {
     const edited = services.map((s) => (s.id === 'b' ? { ...s, hi: 5 } : s));
     const snap2 = markSolved(edited, spans);
