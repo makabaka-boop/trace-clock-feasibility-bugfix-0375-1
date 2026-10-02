@@ -36,7 +36,11 @@
     loading = true;
     errors = [];
     try {
-      const r = await solve({ services, spans, observations });
+      const r = await solve({
+        services,
+        spans,
+        observations: observations.map(observationPayload),
+      });
       result = r;
       solvedSnapshot = markSolved(services, spans, observations);
     } catch (e) {
@@ -54,7 +58,11 @@
       const ex = await loadExample(kind);
       services = ex.services;
       spans = ex.spans;
-      observations = ex.observations || [];
+      observations = (ex.observations || []).map((o) => observationRow({
+        ...o,
+        earlier: o.earlier ?? services[0]?.id ?? '',
+        later: o.later ?? services[1]?.id ?? '',
+      }));
     } catch (e) {
       errors = [String(e.message || e)];
     }
@@ -89,9 +97,48 @@
     if (services.length < 2) return;
     observations = [...observations, {
       id: `o${observations.length + 1}`,
-      earlier: services[0].id, later: services[1].id,
+      earlierKind: 'service', earlier: services[0].id, earlierSpan: '', earlierPoint: 'start',
+      laterKind: 'service', later: services[1].id, laterSpan: '', laterPoint: 'end',
       min: -10, max: 10,
     }];
+  }
+
+  // 把 UI 行的观测对象规整成后端入参：服务端取服务基准点（span 字段留空），
+  // span 端取 span+端点（服务字段留空，由后端按 span 解析）。
+  function observationPayload(o) {
+    const p = { id: o.id, min: Number(o.min), max: Number(o.max) };
+    if (o.earlierKind === 'span') {
+      p.earlierSpan = o.earlierSpan;
+      p.earlierPoint = o.earlierPoint;
+    } else {
+      p.earlier = o.earlier;
+    }
+    if (o.laterKind === 'span') {
+      p.laterSpan = o.laterSpan;
+      p.laterPoint = o.laterPoint;
+    } else {
+      p.later = o.later;
+    }
+    return p;
+  }
+
+  // 后端返回（或示例）里的观测只含服务/span 字段，补成 UI 行需要的形态。
+  function observationRow(o) {
+    const eSpan = !!o.earlierSpan;
+    const lSpan = !!o.laterSpan;
+    return {
+      id: o.id,
+      earlierKind: eSpan ? 'span' : 'service',
+      earlier: o.earlier || services[0]?.id || '',
+      earlierSpan: o.earlierSpan || '',
+      earlierPoint: o.earlierPoint || 'start',
+      laterKind: lSpan ? 'span' : 'service',
+      later: o.later || services[1]?.id || '',
+      laterSpan: o.laterSpan || '',
+      laterPoint: o.laterPoint || 'end',
+      min: o.min,
+      max: o.max,
+    };
   }
 
   // ---------- 时间线几何 ----------
@@ -151,8 +198,21 @@
     return { rows, bars, links, height: y + 14, minT, maxT };
   }
 
+  function obsSideText(o, side) {
+    if (o && o[`${side}Span`]) {
+      return `span ${o[`${side}Span`]} 的 ${o[`${side}Point`] === 'end' ? '终点' : '起点'}`;
+    }
+    const svc = o ? o[side] : '';
+    return svc ? `服务 ${svc} 的基准点` : '基准点';
+  }
+
   function edgeText(e) {
     const ref = e.ref || {};
+    const o = observations.length
+      ? observations
+          .map(observationPayload)
+          .find((x) => x.id === ref.observation)
+      : null;
     switch (ref.kind) {
       case 'bound_upper':
         return `服务 ${ref.service} 的偏移上界（x ≤ hi）`;
@@ -162,8 +222,12 @@
         return `子 span ${ref.span} 起点须不早于父 span ${ref.parentSpan} 起点`;
       case 'child_end':
         return `子 span ${ref.span} 终点须不晚于父 span ${ref.parentSpan} 终点`;
+      case 'observation_min':
+        return `观测 ${ref.observation} 下界：${obsSideText(o, 'earlier')} 到 ${obsSideText(o, 'later')} 的耗时 ≥ min`;
+      case 'observation_max':
+        return `观测 ${ref.observation} 上界：${obsSideText(o, 'earlier')} 到 ${obsSideText(o, 'later')} 的耗时 ≤ max`;
       default:
-        return '未知约束';
+        return `观测/约束 ${ref.observation || ref.kind}`;
     }
   }
 
@@ -233,15 +297,67 @@
   </section>
 
   <section class="card">
-    <h2>服务间偏移观测（{observations.length}）</h2>
-    <table>
-      <thead><tr><th>ID</th><th>较早服务</th><th>较晚服务</th><th>最小差值</th><th>最大差值</th><th></th></tr></thead>
+    <h2>区间观测（{observations.length}）</h2>
+    <p class="hint">
+      实测经过时间区间：min ≤ 较晚事件校正时刻 − 较早事件校正时刻 ≤ max。
+      每端可以是<strong>服务基准点</strong>（校正偏移本身）或某个
+      <strong>span 的起点/终点</strong>，两端可混用、可位于同一服务。
+    </p>
+    <table class="obs">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>较早端</th>
+          <th>较晚端</th>
+          <th>min</th>
+          <th>max</th>
+          <th></th>
+        </tr>
+      </thead>
       <tbody>
         {#each observations as obs, i}
           <tr>
             <td><input class="id" bind:value={obs.id} /></td>
-            <td><select bind:value={obs.earlier}>{#each services as s}<option value={s.id}>{s.id}</option>{/each}</select></td>
-            <td><select bind:value={obs.later}>{#each services as s}<option value={s.id}>{s.id}</option>{/each}</select></td>
+            <td>
+              <select class="kind" bind:value={obs.earlierKind}>
+                <option value="service">服务</option>
+                <option value="span">span 端点</option>
+              </select>
+              {#if obs.earlierKind === 'span'}
+                <select bind:value={obs.earlierSpan}>
+                  <option value="">（选择 span）</option>
+                  {#each spans as sp}<option value={sp.id}>{sp.id}.{obs.earlierPoint}</option>{/each}
+                </select>
+                <select class="point" bind:value={obs.earlierPoint}>
+                  <option value="start">start</option>
+                  <option value="end">end</option>
+                </select>
+              {:else}
+                <select bind:value={obs.earlier}>
+                  {#each services as s}<option value={s.id}>{s.id}</option>{/each}
+                </select>
+              {/if}
+            </td>
+            <td>
+              <select class="kind" bind:value={obs.laterKind}>
+                <option value="service">服务</option>
+                <option value="span">span 端点</option>
+              </select>
+              {#if obs.laterKind === 'span'}
+                <select bind:value={obs.laterSpan}>
+                  <option value="">（选择 span）</option>
+                  {#each spans as sp}<option value={sp.id}>{sp.id}.{obs.laterPoint}</option>{/each}
+                </select>
+                <select class="point" bind:value={obs.laterPoint}>
+                  <option value="start">start</option>
+                  <option value="end">end</option>
+                </select>
+              {:else}
+                <select bind:value={obs.later}>
+                  {#each services as s}<option value={s.id}>{s.id}</option>{/each}
+                </select>
+              {/if}
+            </td>
             <td><input type="number" bind:value={obs.min} /></td>
             <td><input type="number" bind:value={obs.max} /></td>
             <td><button on:click={() => observations = observations.filter((_, j) => j !== i)}>删除</button></td>
@@ -328,6 +444,32 @@
         <p class="hint">余量为 0 表示该侧已顶到父调用边界（紧约束）。</p>
       </section>
     {/if}
+    {#if result.observations && result.observations.length > 0}
+      <section class="card">
+        <h2>观测区间余量</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>观测</th><th>较早端校正时刻</th><th>较晚端校正时刻</th><th>实测端差</th>
+              <th>下界余量</th><th>上界余量</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each result.observations as o}
+              <tr>
+                <td>{o.id}</td>
+                <td>{o.correctedEarlier}</td>
+                <td>{o.correctedLater}</td>
+                <td>{o.difference}</td>
+                <td class:tight={o.minSlack === 0}>{o.minSlack}</td>
+                <td class:tight={o.maxSlack === 0}>{o.maxSlack}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+        <p class="hint">余量为 0 表示该侧顶到观测区间边界；两侧余量均应 ≥ 0。</p>
+      </section>
+    {/if}
   {/if}
 
   {#if showCycle}
@@ -375,6 +517,8 @@
     border-radius: 6px; width: 90px;
   }
   input.id { width: 80px; }
+  select.kind { width: 96px; }
+  select.point { width: 70px; }
   button {
     font: inherit; padding: 4px 12px; border: 1px solid #d0d5dd;
     border-radius: 6px; background: #fff; cursor: pointer;

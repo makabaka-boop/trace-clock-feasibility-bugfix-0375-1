@@ -44,16 +44,21 @@ type Input struct {
 	Observations []OffsetObservation `json:"observations,omitempty"`
 }
 
-// OffsetObservation is an independently measured bound on the difference
-// between two service clocks after correction.
+// OffsetObservation 是两端事件之间实测经过时间的整数区间约束：
+//
+//	min <= 校正后(later 事件) - 校正后(earlier 事件) <= max
+//
+// 每一端要么是某个服务的时钟基准点（原始时刻 0，用 Earlier/Later 指定
+// 服务），要么是某个 span 的起点/终点（用 EarlierSpan+EarlierPoint 指定，
+// 服务由该 span 决定）。两端可位于同一服务，也可混用两种端点。
 type OffsetObservation struct {
 	ID           string `json:"id"`
-	Earlier      string `json:"earlier"`
-	Later        string `json:"later"`
+	Earlier      string `json:"earlier,omitempty"`
+	Later        string `json:"later,omitempty"`
 	EarlierSpan  string `json:"earlierSpan,omitempty"`
 	LaterSpan    string `json:"laterSpan,omitempty"`
-	EarlierPoint string `json:"earlierPoint,omitempty"`
-	LaterPoint   string `json:"laterPoint,omitempty"`
+	EarlierPoint string `json:"earlierPoint,omitempty"` // start | end
+	LaterPoint   string `json:"laterPoint,omitempty"`   // start | end
 	Min          int    `json:"min"`
 	Max          int    `json:"max"`
 }
@@ -168,25 +173,39 @@ func Validate(in Input) []string {
 			add("观测 ID 为空或重复: %q", obs.ID)
 		}
 		seenObservation[obs.ID] = true
-		if obs.EarlierSpan != "" || obs.LaterSpan != "" {
-			if _, ok := byID[obs.EarlierSpan]; !ok {
-				add("观测 %s 引用了未知的起始 span", obs.ID)
-			}
-			if _, ok := byID[obs.LaterSpan]; !ok {
-				add("观测 %s 引用了未知的结束 span", obs.ID)
-			}
-			if (obs.EarlierPoint != "start" && obs.EarlierPoint != "end") ||
-				(obs.LaterPoint != "start" && obs.LaterPoint != "end") {
-				add("观测 %s 的 span 端点无效", obs.ID)
-			}
-		} else if !seenSvc[obs.Earlier] || !seenSvc[obs.Later] || obs.Earlier == obs.Later {
-			add("观测 %s 引用了无效的服务对", obs.ID)
+		eSvc, eOK := resolveObsRef(obs.Earlier, obs.EarlierSpan, obs.EarlierPoint, seenSvc, byID)
+		lSvc, lOK := resolveObsRef(obs.Later, obs.LaterSpan, obs.LaterPoint, seenSvc, byID)
+		if !eOK {
+			add("观测 %s 的起始端无效（须指定存在的服务，或存在的 span 加 start/end 端点）", obs.ID)
+		}
+		if !lOK {
+			add("观测 %s 的结束端无效（须指定存在的服务，或存在的 span 加 start/end 端点）", obs.ID)
+		}
+		// 仅当两端都是服务基准点时，同一服务才无意义（两端点事件允许同服务）。
+		if eOK && lOK && obs.EarlierSpan == "" && obs.LaterSpan == "" && eSvc == lSvc {
+			add("观测 %s 的两个基准点落在同一服务上，不构成服务间约束", obs.ID)
 		}
 		if obs.Min > obs.Max || absExceeds(obs.Min) || absExceeds(obs.Max) {
 			add("观测 %s 的区间无效", obs.ID)
 		}
 	}
 	return errs
+}
+
+// resolveObsRef 解析观测一端，返回该端所在服务 ID。spanID 非空时为该 span
+// 的起点/终点（服务由 span 决定）；否则为 svcID 指向的时钟基准点。
+func resolveObsRef(svcID, spanID, point string, seenSvc map[string]bool, byID map[string]Span) (string, bool) {
+	if spanID != "" {
+		sp, ok := byID[spanID]
+		if !ok || (point != "start" && point != "end") {
+			return "", false
+		}
+		return sp.Service, true
+	}
+	if !seenSvc[svcID] {
+		return "", false
+	}
+	return svcID, true
 }
 
 func absExceeds(v int) bool {
@@ -239,10 +258,12 @@ type Result struct {
 }
 
 type ObservationSlack struct {
-	ID         string `json:"id"`
-	Difference int    `json:"difference"`
-	MinSlack   int    `json:"minSlack"`
-	MaxSlack   int    `json:"maxSlack"`
+	ID               string `json:"id"`
+	Difference       int    `json:"difference"`
+	CorrectedEarlier int    `json:"correctedEarlier"`
+	CorrectedLater   int    `json:"correctedLater"`
+	MinSlack         int    `json:"minSlack"`
+	MaxSlack         int    `json:"maxSlack"`
 }
 
 // buildGraph 把输入化为差分约束图。
@@ -289,13 +310,39 @@ func buildGraph(in Input) (n int, idx map[string]int, order []string, edges []ed
 		)
 	}
 	for _, obs := range in.Observations {
-		earlier, later := idx[obs.Earlier], idx[obs.Later]
+		e := resolveObsEvent(obs.Earlier, obs.EarlierSpan, obs.EarlierPoint, idx, spans)
+		l := resolveObsEvent(obs.Later, obs.LaterSpan, obs.LaterPoint, idx, spans)
+		// 边 u->v (权 w) 表示 x[v]-x[u] <= w；d = (t_l+x[l])-(t_e+x[e])。
+		// d <= max  <=>  x[l]-x[e] <= max-t_l+t_e   => 边 e->l
+		// d >= min  <=>  x[e]-x[l] <= t_l-t_e-min   => 边 l->e
 		edges = append(edges,
-			edge{from: earlier, to: later, w: obs.Max, ref: EdgeRef{Kind: KindObservationMax, Observation: obs.ID}},
-			edge{from: earlier, to: later, w: -obs.Min, ref: EdgeRef{Kind: KindObservationMin, Observation: obs.ID}},
+			edge{from: e.node, to: l.node, w: obs.Max - l.t + e.t,
+				ref: EdgeRef{Kind: KindObservationMax, Observation: obs.ID}},
+			edge{from: l.node, to: e.node, w: l.t - e.t - obs.Min,
+				ref: EdgeRef{Kind: KindObservationMin, Observation: obs.ID}},
 		)
 	}
 	return n, idx, order, edges
+}
+
+// obsEvent 是观测一端解析后的事件：节点 node 的时钟上、本地时刻 t 的点
+// （服务基准点对应 t=0）。
+type obsEvent struct {
+	node int
+	t    int
+}
+
+// resolveObsEvent 把观测的一端解析为 (图节点, 本地时刻)。spanID 非空时
+// 为该 span 的起点/终点，否则为服务 svcID 的时钟基准点（t=0）。
+func resolveObsEvent(svcID, spanID, point string, idx map[string]int, spans map[string]Span) obsEvent {
+	if spanID != "" {
+		sp := spans[spanID]
+		if point == "end" {
+			return obsEvent{node: idx[sp.Service], t: sp.End}
+		}
+		return obsEvent{node: idx[sp.Service], t: sp.Start}
+	}
+	return obsEvent{node: idx[svcID], t: 0}
 }
 
 // negativeCycle 用 Bellman-Ford 检测负环；所有节点距离初始化为 0，
@@ -461,9 +508,14 @@ func Solve(in Input) (Result, error) {
 		})
 	}
 	for _, obs := range in.Observations {
-		difference := res.Offsets[obs.Later] - res.Offsets[obs.Earlier]
+		e := resolveObsEvent(obs.Earlier, obs.EarlierSpan, obs.EarlierPoint, idx, spans)
+		l := resolveObsEvent(obs.Later, obs.LaterSpan, obs.LaterPoint, idx, spans)
+		correctedEarlier := e.t + int(values[e.node])
+		correctedLater := l.t + int(values[l.node])
+		difference := correctedLater - correctedEarlier
 		res.Observations = append(res.Observations, ObservationSlack{
 			ID: obs.ID, Difference: difference,
+			CorrectedEarlier: correctedEarlier, CorrectedLater: correctedLater,
 			MinSlack: difference - obs.Min, MaxSlack: obs.Max - difference,
 		})
 	}

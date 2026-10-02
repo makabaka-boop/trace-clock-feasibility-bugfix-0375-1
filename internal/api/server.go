@@ -68,6 +68,13 @@ func feasibleExample() solver.Input {
 			{ID: "s4", Service: "pay", Parent: "s3", Start: 500, End: 700},
 			{ID: "s5", Service: "auth", Parent: "s1", Start: 320, End: 380},
 		},
+		Observations: []solver.OffsetObservation{
+			// gw 与 auth 基准点的跨服务时钟差落在 ±50。
+			{ID: "o1", Earlier: "gw", Later: "auth", Min: -50, Max: 50},
+			// 从 s1 起点（gw,100）到 s4 终点（pay,700）实测经过 550..650。
+			{ID: "o2", EarlierSpan: "s1", EarlierPoint: "start",
+				LaterSpan: "s4", LaterPoint: "end", Min: 550, Max: 650},
+		},
 	}
 }
 
